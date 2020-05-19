@@ -171,6 +171,7 @@ export default class ChatRoom extends Listenable {
      * writing it's never rejected.
      */
     join(password) {
+        logger.info('Edisonlive, Chatroom.js:join');
         this.password = password;
 
         return new Promise(resolve => {

@@ -55,7 +55,6 @@ const OLD_GUM_DEFAULT_DEVICES = [ 'audio', 'video' ];
  */
 const DEFAULT_CONSTRAINTS = {
     video: {
-        aspectRatio: 16 / 9,
         height: {
             ideal: 720,
             max: 720,
@@ -180,7 +179,7 @@ function getConstraints(um, options = {}) {
     // @see https://github.com/jitsi/lib-jitsi-meet/pull/136
     const isNewStyleConstraintsSupported
         = browser.isFirefox()
-            || browser.isSafariWithVP8()
+            || browser.isSafari()
             || browser.isReactNative();
 
     if (um.indexOf('video') >= 0) {
@@ -399,27 +398,36 @@ function newGetConstraints(um = [], options = {}) {
             constraints.audio = {};
         }
 
-        // NOTE(brian): the new-style ('advanced' instead of 'optional')
-        // doesn't seem to carry through the googXXX constraints
-        // Changing back to 'optional' here (even with video using
-        // the 'advanced' style) allows them to be passed through
-        // but also requires the device id to capture to be set in optional
-        // as sourceId otherwise the constraints are considered malformed.
-        if (!constraints.audio.optional) {
-            constraints.audio.optional = [];
+        // Use the standard audio constraints on non-chromium browsers.
+        if (browser.isFirefox() || browser.isSafari()) {
+            constraints.audio = {
+                deviceId: options.micDeviceId,
+                autoGainControl: !disableAGC && !disableAP,
+                echoCancellation: !disableAEC && !disableAP,
+                noiseSuppression: !disableNS && !disableAP
+            };
+        } else {
+            // NOTE(brian): the new-style ('advanced' instead of 'optional')
+            // doesn't seem to carry through the googXXX constraints
+            // Changing back to 'optional' here (even with video using
+            // the 'advanced' style) allows them to be passed through
+            // but also requires the device id to capture to be set in optional
+            // as sourceId otherwise the constraints are considered malformed.
+            if (!constraints.audio.optional) {
+                constraints.audio.optional = [];
+            }
+            constraints.audio.optional.push(
+                { sourceId: options.micDeviceId },
+                { echoCancellation: !disableAEC && !disableAP },
+                { googEchoCancellation: !disableAEC && !disableAP },
+                { googAutoGainControl: !disableAGC && !disableAP },
+                { googNoiseSuppression: !disableNS && !disableAP },
+                { googHighpassFilter: !disableHPF && !disableAP },
+                { googNoiseSuppression2: !disableNS && !disableAP },
+                { googEchoCancellation2: !disableAEC && !disableAP },
+                { googAutoGainControl2: !disableAGC && !disableAP }
+            );
         }
-
-        constraints.audio.optional.push(
-            { sourceId: options.micDeviceId },
-            { echoCancellation: !disableAEC && !disableAP },
-            { googEchoCancellation: !disableAEC && !disableAP },
-            { googAutoGainControl: !disableAGC && !disableAP },
-            { googNoiseSuppression: !disableNS && !disableAP },
-            { googHighpassFilter: !disableHPF && !disableAP },
-            { googNoiseSuppression2: !disableNS && !disableAP },
-            { googEchoCancellation2: !disableAEC && !disableAP },
-            { googAutoGainControl2: !disableAGC && !disableAP }
-        );
     } else {
         constraints.audio = false;
     }
@@ -1436,7 +1444,7 @@ class RTCUtils extends Listenable {
     isDeviceChangeAvailable(deviceType) {
         return deviceType === 'output' || deviceType === 'audiooutput'
             ? isAudioOutputDeviceChangeAvailable
-            : !browser.isSafariWithVP8();
+            : true;
     }
 
     /**

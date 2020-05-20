@@ -4,6 +4,8 @@ import transform from 'sdp-transform';
 import * as JitsiTrackEvents from '../../JitsiTrackEvents';
 import browser from '../browser';
 import RTCEvents from '../../service/RTC/RTCEvents';
+import * as MediaType from '../../service/RTC/MediaType';
+import * as VideoType from '../../service/RTC/VideoType';
 
 const logger = getLogger(__filename);
 const SIM_LAYER_1_RID = '1';
@@ -47,6 +49,46 @@ export class TPCUtils {
                 scaleResolutionDownBy: browser.isFirefox() ? 4.0 : 1.0
             }
         ];
+
+        /**
+         * Resolution height constraints for the simulcast encodings that
+         * are configured for the video tracks.
+         */
+        this.simulcastStreamConstraints = [];
+    }
+
+    /**
+     * Ensures that the ssrcs associated with a FID ssrc-group appear in the correct order, i.e.,
+     * the primary ssrc first and the secondary rtx ssrc later. This is important for unified
+     * plan since we have only one FID group per media description.
+     * @param {Object} description the webRTC session description instance for the remote
+     * description.
+     * @private
+     */
+    _ensureCorrectOrderOfSsrcs(description) {
+        const parsedSdp = transform.parse(description.sdp);
+
+        parsedSdp.media.forEach(mLine => {
+            if (mLine.type === 'audio') {
+                return;
+            }
+            if (!mLine.ssrcGroups || !mLine.ssrcGroups.length) {
+                return;
+            }
+            let reorderedSsrcs = [];
+
+            mLine.ssrcGroups[0].ssrcs.split(' ').forEach(ssrc => {
+                const sources = mLine.ssrcs.filter(source => source.id.toString() === ssrc);
+
+                reorderedSsrcs = reorderedSsrcs.concat(sources);
+            });
+            mLine.ssrcs = reorderedSsrcs;
+        });
+
+        return new RTCSessionDescription({
+            type: description.type,
+            sdp: transform.write(parsedSdp)
+        });
     }
 
     /**
@@ -88,7 +130,15 @@ export class TPCUtils {
                 if (mline.type === 'video' && i !== idx) {
                     sdp.media[i].rids = undefined;
                     sdp.media[i].simulcast = undefined;
+
+                    // eslint-disable-next-line camelcase
+                    sdp.media[i].simulcast_03 = undefined;
                 }
+            });
+
+            return new RTCSessionDescription({
+                type: desc.type,
+                sdp: transform.write(sdp)
             });
         }
 
@@ -127,6 +177,29 @@ export class TPCUtils {
     }
 
     /**
+     * Constructs resolution height constraints for the simulcast encodings that are
+     * created for a given local video track.
+     * @param {MediaStreamTrack} track - the local video track.
+     * @returns {void}
+     */
+    _setSimulcastStreamConstraints(track) {
+        if (browser.isReactNative()) {
+            return;
+        }
+
+        const height = track.getSettings().height;
+
+        for (const encoding in this.simulcastEncodings) {
+            if (this.simulcastEncodings.hasOwnProperty(encoding)) {
+                this.simulcastStreamConstraints.push({
+                    height: height / this.simulcastEncodings[encoding].scaleResolutionDownBy,
+                    rid: this.simulcastEncodings[encoding].rid
+                });
+            }
+        }
+    }
+
+    /**
     * Adds {@link JitsiLocalTrack} to the WebRTC peerconnection for the first time.
     * @param {JitsiLocalTrack} track - track to be added to the peerconnection.
     * @returns {boolean} Returns true if the operation is successful,
@@ -154,13 +227,18 @@ export class TPCUtils {
             // unused "recv-only" transceiver.
             this.pc.peerconnection.addTrack(track);
         }
+
+        // Construct the simulcast stream constraints for the newly added track.
+        if (localTrack.isVideoTrack() && localTrack.videoType === VideoType.CAMERA && this.pc.isSimulcastOn()) {
+            this._setSimulcastStreamConstraints(localTrack.getTrack());
+        }
     }
 
     /**
      * Adds a track on the RTCRtpSender as part of the unmute operation.
      * @param {JitsiLocalTrack} localTrack - track to be unmuted.
-     * @returns {boolean} Returns true if the operation is successful,
-     * false otherwise.
+     * @returns {Promise<boolean>} - Promise that resolves to false if unmute
+     * operation is successful, a reject otherwise.
      */
     addTrackUnmute(localTrack) {
         const mediaType = localTrack.getType();
@@ -172,11 +250,9 @@ export class TPCUtils {
             .find(t => t.receiver && t.receiver.track && t.receiver.track.kind === mediaType);
 
         if (!transceiver) {
-            logger.error(`RTCRtpTransceiver for ${mediaType} on ${this.pc} not found`);
-
-            return false;
+            return Promise.reject(new Error(`RTCRtpTransceiver for ${mediaType} not found`));
         }
-        logger.info(`Adding ${localTrack} on ${this.pc}`);
+        logger.debug(`Adding ${localTrack} on ${this.pc}`);
 
         // If the client starts with audio/video muted setting, the transceiver direction
         // will be set to 'recvonly'. Use addStream here so that a MSID is generated for the stream.
@@ -186,26 +262,22 @@ export class TPCUtils {
             this.pc.localTracks.set(localTrack.rtcId, localTrack);
             transceiver.direction = 'sendrecv';
 
-            return true;
+            return Promise.resolve(false);
         }
-        transceiver.sender.replaceTrack(track)
+
+        return transceiver.sender.replaceTrack(track)
             .then(() => {
                 this.pc.localTracks.set(localTrack.rtcId, localTrack);
 
-                return true;
-            })
-            .catch(err => {
-                logger.error(`Unmute track failed for ${mediaType} track on ${this.pc}, ${err}`);
-
-                return false;
+                return Promise.resolve(false);
             });
     }
 
     /**
      * Removes the track from the RTCRtpSender as part of the mute operation.
      * @param {JitsiLocalTrack} localTrack - track to be removed.
-     * @returns {boolean} Returns true if the operation is successful,
-     * false otherwise.
+     * @returns {Promise<boolean>} - Promise that resolves to false if unmute
+     * operation is successful, a reject otherwise.
      */
     removeTrackMute(localTrack) {
         const mediaType = localTrack.getType();
@@ -213,23 +285,16 @@ export class TPCUtils {
             .find(t => t.sender && t.sender.track && t.sender.track.id === localTrack.getTrackId());
 
         if (!transceiver) {
-            logger.error(`RTCRtpTransceiver for ${mediaType} on ${this.pc} not found`);
-
-            return false;
+            return Promise.reject(new Error(`RTCRtpTransceiver for ${mediaType} not found`));
         }
 
-        logger.info(`Removing ${localTrack} on ${this.pc}`);
-        transceiver.sender.replaceTrack(null)
+        logger.debug(`Removing ${localTrack} on ${this.pc}`);
+
+        return transceiver.sender.replaceTrack(null)
             .then(() => {
                 this.pc.localTracks.delete(localTrack.rtcId);
-                this.pc.localSSRCs.delete(localTrack.rtcId);
 
-                return true;
-            })
-            .catch(err => {
-                logger.error(`Mute track failed for ${mediaType} track on ${this.pc}, ${err}`);
-
-                return false;
+                return Promise.resolve(false);
             });
     }
 
@@ -245,13 +310,16 @@ export class TPCUtils {
         if (oldTrack && newTrack) {
             const mediaType = newTrack.getType();
             const stream = newTrack.getOriginalStream();
-            const track = stream.getVideoTracks()[0];
+            const track = mediaType === MediaType.AUDIO
+                ? stream.getAudioTracks()[0]
+                : stream.getVideoTracks()[0];
             const transceiver = this.pc.peerconnection.getTransceivers()
                 .find(t => t.receiver.track.kind === mediaType && !t.stopped);
 
             if (!transceiver) {
                 return Promise.reject(new Error('replace track failed'));
             }
+            logger.debug(`Replacing ${oldTrack} with ${newTrack} on ${this.pc}`);
 
             return transceiver.sender.replaceTrack(track)
                 .then(() => {

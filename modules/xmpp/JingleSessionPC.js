@@ -56,8 +56,6 @@ const DEFAULT_MAX_STATS = 300;
  * @property {boolean} p2p.preferH264 - Described in the config.js[1].
  * @property {boolean} preferH264 - Described in the config.js[1].
  * @property {Object} testing - Testing and/or experimental options.
- * @property {boolean} testing.enableFirefoxSimulcast - Described in the
- * config.js[1].
  * @property {boolean} webrtcIceUdpDisable - Described in the config.js[1].
  * @property {boolean} webrtcIceTcpDisable - Described in the config.js[1].
  *
@@ -316,8 +314,6 @@ export default class JingleSessionPC extends JingleSession {
                 = options.disableSimulcast
                     || (options.preferH264 && !options.disableH264);
             pcOptions.preferH264 = options.preferH264;
-            pcOptions.enableFirefoxSimulcast
-                = options.testing && options.testing.enableFirefoxSimulcast;
             pcOptions.enableLayerSuspension = options.enableLayerSuspension;
 
             // disable simulcast for screenshare and set the max bitrate to
@@ -723,15 +719,16 @@ export default class JingleSessionPC extends JingleSession {
                     id: this._bridgeSessionId
                 });
 
-        this.connection.sendIQ(
-            sessionInfo,
-            null,
-            this.newJingleErrorHandler(sessionInfo),
-            /*
-             * This message will be often sent when there are connectivity
-             * issues, so make it slightly longer than Prosody's default BOSH
-             * inactivity timeout of 60 seconds.
-             */ 65);
+        this.connection.sendIQ2(
+            sessionInfo, {
+                /*
+                 * This message will be often sent when there are connectivity
+                 * issues, so make it slightly longer than Prosody's default BOSH
+                 * inactivity timeout of 60 seconds.
+                 */
+                timeout: 65
+            })
+            .catch(this.newJingleErrorHandler(sessionInfo));
     }
 
     /**
@@ -1333,6 +1330,16 @@ export default class JingleSessionPC extends JingleSession {
     }
 
     /**
+     * Sets the resolution constraint on the local camera track.
+     * @param {number} maxFrameHeight - The user preferred max frame height.
+     * @returns {Promise} promise that will be resolved when the operation is
+     * successful and rejected otherwise.
+     */
+    setSenderVideoConstraint(maxFrameHeight) {
+        return this.peerconnection.setSenderVideoConstraint(maxFrameHeight);
+    }
+
+    /**
      * @inheritDoc
      */
     terminate(success, failure, options) {
@@ -1597,16 +1604,36 @@ export default class JingleSessionPC extends JingleSession {
      *  in removeSsrcInfo
      */
     _processRemoteRemoveSource(removeSsrcInfo) {
-        const remoteSdp = new SDP(this.peerconnection.remoteDescription.sdp);
+        const remoteSdp = browser.usesPlanB()
+            ? new SDP(this.peerconnection.remoteDescription.sdp)
+            : new SDP(this.peerconnection.peerconnection.remoteDescription.sdp);
 
         removeSsrcInfo.forEach((lines, idx) => {
             // eslint-disable-next-line no-param-reassign
             lines = lines.split('\r\n');
             lines.pop(); // remove empty last element;
-            lines.forEach(line => {
-                remoteSdp.media[idx]
-                    = remoteSdp.media[idx].replace(`${line}\r\n`, '');
-            });
+            if (browser.usesPlanB()) {
+                lines.forEach(line => {
+                    remoteSdp.media[idx]
+                        = remoteSdp.media[idx].replace(`${line}\r\n`, '');
+                });
+            } else {
+                lines.forEach(line => {
+                    const mid = remoteSdp.media.findIndex(mLine => mLine.includes(line));
+
+                    if (mid > -1) {
+                        remoteSdp.media[mid] = remoteSdp.media[mid].replace(`${line}\r\n`, '');
+
+                        // Change the direction to "inactive" only on Firefox. Audio fails on
+                        // Safari (possibly Chrome in unified plan mode) when we try to re-use inactive
+                        // m-lines due to a webkit bug.
+                        // https://bugs.webkit.org/show_bug.cgi?id=211181
+                        if (browser.isFirefox()) {
+                            remoteSdp.media[mid] = remoteSdp.media[mid].replace('a=sendonly', 'a=inactive');
+                        }
+                    }
+                });
+            }
         });
         remoteSdp.raw = remoteSdp.session + remoteSdp.media.join('');
 
@@ -1701,28 +1728,6 @@ export default class JingleSessionPC extends JingleSession {
      * @private
      */
     _initiatorRenegotiate(remoteDescription) {
-        if (this.peerconnection.signalingState === 'have-local-offer') {
-            // Skip createOffer and setLocalDescription or FF will fail
-            logger.debug(
-                'Renegotiate: setting remote description');
-
-            /* eslint-disable arrow-body-style */
-
-            return this.peerconnection.setRemoteDescription(remoteDescription)
-                .then(() => {
-                    // In case when the answer is being set for the first time,
-                    // full sRD/sLD cycle is required to have the local
-                    // description updated and SSRCs synchronized correctly.
-                    // Otherwise SSRCs for streams added after invite, but
-                    // before the answer was accepted will not be detected.
-                    // The reason for that is that renegotiate can not be called
-                    // when adding tracks and they will not be reflected in
-                    // the local SDP.
-                    return this._initiatorRenegotiate(remoteDescription);
-                });
-            /* eslint-enable arrow-body-style */
-        }
-
         logger.debug('Renegotiate: creating offer');
 
         return this.peerconnection.createOffer(this.mediaConstraints)
@@ -2001,29 +2006,28 @@ export default class JingleSessionPC extends JingleSession {
                 return;
             }
             const oldLocalSDP = tpc.localDescription.sdp;
-            const tpcOperation
+            const operationPromise
                 = isMute
-                    ? tpc.removeTrackMute.bind(tpc, track)
-                    : tpc.addTrackUnmute.bind(tpc, track);
+                    ? tpc.removeTrackMute(track)
+                    : tpc.addTrackUnmute(track);
 
-            if (!tpcOperation()) {
-                finishedCallback(`${operationName} failed!`);
-
-            // Do not renegotiate when browser is running in Unified-plan mode.
-            } else if (!oldLocalSDP || !tpc.remoteDescription.sdp || browser.usesUnifiedPlan()) {
-                finishedCallback();
-            } else {
-                this._renegotiate()
-                    .then(() => {
-                        // The results are ignored, as this check failure is not
-                        // enough to fail the whole operation. It will log
-                        // an error inside.
-                        this._verifyNoSSRCChanged(
-                            operationName, new SDP(oldLocalSDP));
+            operationPromise
+                .then(shouldRenegotiate => {
+                    if (shouldRenegotiate && oldLocalSDP && tpc.remoteDescription.sdp) {
+                        this._renegotiate()
+                            .then(() => {
+                                // The results are ignored, as this check failure is not
+                                // enough to fail the whole operation. It will log
+                                // an error inside.
+                                this._verifyNoSSRCChanged(
+                                    operationName, new SDP(oldLocalSDP));
+                                finishedCallback();
+                            });
+                    } else {
                         finishedCallback();
-                    },
-                    finishedCallback /* will be called with an error */);
-            }
+                    }
+                },
+                finishedCallback /* will be called with an error */);
         };
 
         return new Promise((resolve, reject) => {
@@ -2332,7 +2336,7 @@ export default class JingleSessionPC extends JingleSession {
      * @returns the ice connection state for the peer connection.
      */
     getIceConnectionState() {
-        return this.peerconnection.iceConnectionState;
+        return this.peerconnection.getConnectionState();
     }
 
     /**

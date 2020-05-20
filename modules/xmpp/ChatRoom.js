@@ -1433,36 +1433,21 @@ export default class ChatRoom extends Listenable {
      * @param mute
      */
     muteParticipant(jid, mute) {
-        logger.info('request screen sharing', mute);
+        logger.info('set mute', mute);
         const iqToFocus = $iq(
             { to: this.focusMucJid,
                 type: 'set' })
-            .c('requestScreenSharing', {
-                xmlns: 'http://jitsi.org/jitmeet/requestScreenSharing',
-                jid,
-                requestScreenSharing: true
+            .c('mute', {
+                xmlns: 'http://jitsi.org/jitmeet/audio',
+                jid
             })
+            .t(mute.toString())
             .up();
 
         this.connection.sendIQ(
             iqToFocus,
-            result => logger.log('request screen share', result),
-            error => logger.log('request screen share error', error));
-
-        // const iqToFocus = $iq(
-        //     { to: this.focusMucJid,
-        //         type: 'set' })
-        //     .c('mute', {
-        //         xmlns: 'http://jitsi.org/jitmeet/audio',
-        //         jid
-        //     })
-        //     .t(mute.toString())
-        //     .up();
-
-        // this.connection.sendIQ(
-        //     iqToFocus,
-        //     result => logger.log('set mute', result),
-        //     error => logger.log('set mute error', error));
+            result => logger.log('set mute', result),
+            error => logger.log('set mute error', error));
     }
 
     /**
